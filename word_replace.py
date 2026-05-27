@@ -6,6 +6,7 @@
 
 import os
 import shutil
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -97,7 +98,9 @@ def _replace_in_runs(runs, find_text, replace_text):
 
 
 def replace_in_docx(filepath, find_text, replace_text):
-    """对 .docx 文件执行替换，返回替换次数。"""
+    """对 .docx 文件执行替换，返回替换次数。
+    先通过 python-docx 高层 API 处理正文/表格/页眉页脚，
+    再通过 XML 级别扫描覆盖内容控件(SDT)、文本框等被遗漏的结构。"""
     try:
         from docx import Document
     except ImportError:
@@ -114,6 +117,12 @@ def replace_in_docx(filepath, find_text, replace_text):
             for cell in row.cells:
                 for para in cell.paragraphs:
                     count += _replace_in_runs(para.runs, find_text, replace_text)
+                # 嵌套表格
+                for nested_table in cell.tables:
+                    for nrow in nested_table.rows:
+                        for ncell in nrow.cells:
+                            for para in ncell.paragraphs:
+                                count += _replace_in_runs(para.runs, find_text, replace_text)
 
     # 页眉页脚
     for section in doc.sections:
@@ -121,6 +130,42 @@ def replace_in_docx(filepath, find_text, replace_text):
             count += _replace_in_runs(para.runs, find_text, replace_text)
         for para in section.footer.paragraphs:
             count += _replace_in_runs(para.runs, find_text, replace_text)
+
+    # XML 级别扫描：覆盖内容控件(SDT)、文本框等 python-docx 高层 API 遗漏的结构
+    NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    def _xml_per_run_scan(root_elem):
+        """逐个 w:t 元素替换，返回替换次数。"""
+        n = 0
+        for elem in root_elem.iter():
+            if elem.tag == f'{{{NS}}}t' and elem.text and find_text in elem.text:
+                n += elem.text.count(find_text)
+                elem.text = elem.text.replace(find_text, replace_text)
+        return n
+
+    def _xml_cross_run_scan(root_elem):
+        """跨 w:t 替换：处理文字被拆分到同一段落内多个 w:t 的情况。"""
+        n = 0
+        for para_elem in root_elem.iter(f'{{{NS}}}p'):
+            wt_elems = para_elem.findall(f'.//{{{NS}}}t')
+            if len(wt_elems) < 2:
+                continue
+            combined = ''.join(wt.text or '' for wt in wt_elems)
+            if find_text in combined:
+                n += combined.count(find_text)
+                wt_elems[0].text = combined.replace(find_text, replace_text)
+                for wt in wt_elems[1:]:
+                    wt.text = ''
+        return n
+
+    count += _xml_per_run_scan(doc.element.body)
+    count += _xml_cross_run_scan(doc.element.body)
+
+    # 页眉页脚的 XML 级别扫描
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            count += _xml_per_run_scan(part._element)
+            count += _xml_cross_run_scan(part._element)
 
     if count:
         doc.save(filepath)
@@ -225,45 +270,56 @@ def _cleanup_com():
 
 
 def replace_in_doc(filepath, find_text, replace_text):
-    """对 .doc 旧格式文件执行替换（通过 Word COM），返回替换次数。"""
+    """对 .doc 旧格式文件执行替换（通过 Word COM），返回替换次数。
+    遇到路径包含特殊字符导致 Word 无法打开时，自动复制到临时目录处理。"""
     try:
         import win32com.client
     except ImportError:
         return -1
 
+    filepath = str(Path(filepath).resolve())
+
+    def _open_and_replace(path):
+        doc = word.Documents.Open(path)
+        try:
+            original = doc.Content.Text
+            if find_text not in original:
+                return 0
+            count = original.count(find_text)
+            word.Selection.HomeKey(Unit=6)  # wdStory
+            find_obj = word.Selection.Find
+            find_obj.ClearFormatting()
+            find_obj.Replacement.ClearFormatting()
+            find_obj.Execute(
+                find_text, False, False, False, False, False,
+                True, 1, False, replace_text, 2,
+            )
+            doc.Save()
+            return count
+        finally:
+            doc.Close()
+
     word = _get_word()
-    doc = word.Documents.Open(filepath)
+
+    # Try direct open first
     try:
-        original = doc.Content.Text
+        return _open_and_replace(filepath)
+    except Exception:
+        pass
 
-        if find_text not in original:
-            return 0
-
-        count = original.count(find_text)
-
-        # 使用 Selection.Find.Execute 传全部位置参数，比属性逐个赋值更可靠
-        word.Selection.HomeKey(Unit=6)  # wdStory，跳到文档开头
-        find = word.Selection.Find
-        find.ClearFormatting()
-        find.Replacement.ClearFormatting()
-        find.Execute(
-            find_text,   # FindText
-            False,       # MatchCase
-            False,       # MatchWholeWord
-            False,       # MatchWildcards
-            False,       # MatchSoundsLike
-            False,       # MatchAllWordForms
-            True,        # Forward
-            1,           # Wrap (wdFindContinue)
-            False,       # Format
-            replace_text,  # ReplaceWith
-            2,           # Replace (wdReplaceAll)
-        )
-
-        doc.Save()
+    # Fallback: the path may contain chars Word COM can't handle
+    # Copy to a temp dir with a simple ASCII name, process, copy back
+    tmpdir = tempfile.mkdtemp()
+    try:
+        ext = os.path.splitext(filepath)[1]
+        tmpfile = os.path.join(tmpdir, f"_tmp{ext}")
+        shutil.copy2(filepath, tmpfile)
+        count = _open_and_replace(tmpfile)
+        if count:
+            shutil.copy2(tmpfile, filepath)
         return count
     finally:
-        doc.Close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def replace_in_xls(filepath, find_text, replace_text):
